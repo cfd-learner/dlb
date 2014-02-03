@@ -1,27 +1,15 @@
 #ifndef LBM_HPP_
 #define LBM_HPP_
 ////////////////////////////////////////////////////////////////////////////////
-#include <boost/range/counting_range.hpp>
-#include <boost/range/algorithm.hpp>
-#include <boost/range/numeric.hpp>
 #include <thrust/host_vector.h>
 #include <thrust/device_vector.h>
-#include <thrust/generate.h>
-#include <thrust/sort.h>
-#include <thrust/copy.h>
-#include <thrust/reduce.h>
-#include <thrust/for_each.h>
-#include <thrust/transform_reduce.h>
-#include <thrust/iterator_range.h>
-#include <thrust/device_new.h>
-#include <thrust/device_delete.h>
-#include <boost/foreach.hpp>
+#include <thrust/range.h>
 ////////////////////////////////////////////////////////////////////////////////
 
 namespace lbm {
 
 typedef double Num;
-typedef thrust::device_reference<Num> NumRef;
+typedef Num& NumRef;
 typedef long Idx;
 
 template<class I> struct Range {
@@ -31,6 +19,7 @@ template<class I> struct Range {
 typedef Range<Idx>::type CellRange;
 
 struct cylinder {
+  __host__ __device__
   cylinder(const Idx lx, const Idx ly)
       : x_c(lx / 2. - 0.2 * lx), y_c(ly / 2.), r(0.125 * ly) {}
   const Num x_c;
@@ -40,15 +29,6 @@ struct cylinder {
 
 struct node_vars {};
 struct hlp_vars  {};
-
-
-template<class I>
-__host__ __device__
-typename Range<I>::type make_counting_range(I b, I e) {
-  return thrust::make_iterator_range(
-      thrust::counting_iterator<I>(b),
-      thrust::counting_iterator<I>(e));
-}
 
 struct device_data {
   const Idx lx;
@@ -60,8 +40,8 @@ struct device_data {
   const Num omega;   // relaxation parameter
   const Num accel;   // accelleration
 
-  thrust::device_ptr<Num> nodes_;
-  thrust::device_ptr<Num> nodes_hlp_;
+  Num* nodes_;
+  Num* nodes_hlp_;
 
   /// host-device kernels
   __host__ __device__ Idx n_size() const { return 9; }
@@ -72,41 +52,35 @@ struct device_data {
   __host__ __device__ Idx no_nodes() const { return n_size() * no_cells(); }
 
   __host__ __device__
-  device_data(const Idx size_x = 0, const Idx size_y = 0)
+  device_data(const Idx size_x, const Idx size_y,
+              thrust::device_vector<Num>& nodes,
+              thrust::device_vector<Num>& nodes_hlp)
       : lx(size_x), ly(size_y), cyl(lx, ly)
       , density(0.1)
       , c_squ(1. / 3.)
       , omega(1.85)
       , accel(0.015)
+      , nodes_(thrust::raw_pointer_cast(nodes.data()))
+      , nodes_hlp_(thrust::raw_pointer_cast(nodes_hlp.data()))
   {}
 
-  __host__ __device__
-  void initialize() {
-    nodes_ = thrust::device_new<Num>(no_nodes());
-    nodes_hlp_ = thrust::device_new<Num>(no_nodes());
-  }
-
-  ~device_data() {
-    if(nodes_.get()) { thrust::device_delete(nodes_, no_nodes()); }
-    if(nodes_hlp_.get()) { thrust::device_delete(nodes_, no_nodes()); }
-  }
-
-
   // device kernels
-  __device__
-  CellRange direct_node_ids() const { return make_counting_range<Idx>(1, 5); }
-
-  __device__
-  CellRange diagonal_node_ids() const { return make_counting_range<Idx>(5, 9); }
-
-  __device__
+  __host__ __device__
   CellRange cell_ids() const {
-    return make_counting_range<Idx>(0, no_cells());
+    return thrust::make_counting_range<Idx>(0, no_cells());
   }
   __device__
   CellRange node_ids() const {
-    return make_counting_range<Idx>(0, n_size());
+    return thrust::make_counting_range<Idx>(0, n_size());
   }
+
+  __device__
+  CellRange direct_node_ids() const
+  { return thrust::make_counting_range<Idx>(1, 5); }
+
+  __device__
+  CellRange diagonal_node_ids() const
+  { return thrust::make_counting_range<Idx>(5, 9); }
 
   __device__
   Idx opposite_node(const Idx n) const {
@@ -119,13 +93,13 @@ struct device_data {
     return xIdx + x_size() * yIdx;
   }
 
-  __device__
+  __host__ __device__
   Idx x(      Idx cIdx) const {
     while (cIdx > lx - 1) { cIdx -= lx; }
     return cIdx;
   }
 
-  __device__
+  __host__ __device__
   int y(const Idx cIdx) const { return cIdx / lx; }
 
   __device__
@@ -200,205 +174,217 @@ struct device_data {
   Idx idx(const Idx nIdx, const Idx xIdx, const Idx yIdx)
   { return nIdx + n_size() * (xIdx + x_size() * yIdx); }
 
-  __device__
+  __host__ __device__
   bool in_cylinder(const Idx xi, const Idx yi) const {
     return std::sqrt(std::pow(cyl.x_c - xi, 2.) + std::pow(cyl.y_c - yi, 2))
         - cyl.r < 0.;
   }
 
-  __device__
+  __host__ __device__
   bool obst(const Idx x, const Idx y) const
   { return in_cylinder(x, y) || y == 0 || y == ly - 1; }
 
-  __device__
+  __host__ __device__
   bool obst(const Idx cIdx) const { return obst(x(cIdx), y(cIdx)); }
 };
-
-typedef thrust::device_ptr<device_data> data_ptr;
-typedef device_data* raw_data_ptr;
 
 namespace kernel {
 
 
 template<class T>
-struct density {
-  raw_data_ptr d;
+struct density : thrust::unary_function<Idx, Num> {
+  device_data d;
 
-  __device__
-  density(raw_data_ptr data) : d(data) {}
+  __host__ __device__
+  density(device_data data) : d(data) {}
 
   __device__
   Num operator()(const Idx c) const {
     Num tmp = 0;
     typedef thrust::counting_iterator<Idx> It;
-    for (It i = (*d).node_ids().begin(), e = (*d).node_ids().end(); i != e; ++i) {
-      tmp += (*d).vars(T(), c, *i);
+    for (It i = d.node_ids().begin(), e = d.node_ids().end(); i != e; ++i) {
+      tmp += d.vars(T(), c, *i);
     }
     return tmp;
   }
 };
 
-template<class T> struct pressure {
-  raw_data_ptr d;
+template<class T> struct pressure : thrust::unary_function<Idx, Num> {
+  device_data d;
 
-  __device__
-  pressure(raw_data_ptr data) : d(data) {}
+  __host__ __device__
+  pressure(device_data data) : d(data) {}
   __device__ Num operator()(const Idx c) const {
-    if ((*d).obst(c)) {
-      return (*d).density * (*d).c_squ;
+    if (d.obst(c)) {
+      return d.density * d.c_squ;
     } else {
-      return density<T>(d)(c) * (*d).c_squ;
+      return density<T>(d)(c) * d.c_squ;
     }
   }
 };
 
-template<class T> struct u {
-  raw_data_ptr d;
+template<class T> struct u : thrust::unary_function<Idx, Num> {
+  device_data d;
 
-  __device__
-  u(raw_data_ptr data) : d(data) {}
+  __host__ __device__
+  u(device_data data) : d(data) {}
 
   __device__
   Num operator()(const Idx c) const {
-    if ((*d).obst(c)) {
+    if (d.obst(c)) {
       return 0.;
     } else {
-      return ((*d).vars(T(), c, 1) + (*d).vars(T(), c, 5) + (*d).vars(T(), c, 8)
-              -((*d).vars(T(), c, 3) + (*d).vars(T(), c, 6) + (*d).vars(T(), c, 7)))
+      return (d.vars(T(), c, 1) + d.vars(T(), c, 5) + d.vars(T(), c, 8)
+              -(d.vars(T(), c, 3) + d.vars(T(), c, 6) + d.vars(T(), c, 7)))
           / density<T>(d)(c);
     }
   }
 };
 
-template<class T> struct v {
-  raw_data_ptr d;
-  __device__ v(raw_data_ptr data) : d(data) {}
+template<class T> struct v : thrust::unary_function<Idx, Num> {
+  device_data d;
+
+  __host__ __device__
+  v(device_data data) : d(data) {}
 
   __device__
   Num operator()(const Idx c) const {
-    if ((*d).obst(c)) {
+    if (d.obst(c)) {
       return 0.;
     } else {
-      return ((*d).vars(T(), c, 2) + (*d).vars(T(), c, 5) + (*d).vars(T(), c, 6)
-              -((*d).vars(T(), c, 4) + (*d).vars(T(), c, 7) + (*d).vars(T(), c, 8)))
+      return (d.vars(T(), c, 2) + d.vars(T(), c, 5) + d.vars(T(), c, 6)
+              -(d.vars(T(), c, 4) + d.vars(T(), c, 7) + d.vars(T(), c, 8)))
           / density<T>(d)(c);
     }
   }
 };
 
 struct init_variables {
-  raw_data_ptr d;
+  device_data d;
   const Num t_0;
   const Num t_1;
   const Num t_2;
 
-  __device__ init_variables(raw_data_ptr data)
+  __host__ __device__
+  init_variables(device_data data)
       : d(data)
-      , t_0((*d).density * 4. / 9)
-      , t_1((*d).density / 9.)
-      , t_2((*d).density / 36.) {}
+      , t_0(d.density * 4. / 9)
+      , t_1(d.density / 9.)
+      , t_2(d.density / 36.) {}
 
   __device__
-  void operator()(const Idx c) const {
-    d->nodes(c, 0) = t_0;  // zero velocity density
-    BOOST_FOREACH(Idx i, d->direct_node_ids())
+  void operator()(const Idx c) {
+    d.nodes(c, 0) = t_0;  // zero velocity density
+    for (thrust::counting_iterator<Idx> bIt = d.direct_node_ids().begin(),
+                                        eIt = d.direct_node_ids().end();
+         bIt != eIt; ++bIt)
     {
-      d->nodes(c, i) = t_1;  // equilibrium densities for axis speeds
+      const Idx i = *bIt;
+      d.nodes(c, i) = t_1;  // equilibrium densities for axis speeds
     }
-    BOOST_FOREACH(Idx i, d->diagonal_node_ids())
+    for (thrust::counting_iterator<Idx> bIt = d.diagonal_node_ids().begin(),
+                                        eIt = d.diagonal_node_ids().end();
+         bIt != eIt; ++bIt)
     {
-      d->nodes(c, i) = t_2;  // equilibrium densities for diagonal speeds
+      const Idx i = *bIt;
+      d.nodes(c, i) = t_2;  // equilibrium densities for diagonal speeds
     }
   }
 };
 
 struct redistribute {
-  raw_data_ptr d;
+  device_data d;
   const Num t_1;
   const Num t_2;
 
-  __device__
-  redistribute(raw_data_ptr data)
+  __host__ __device__
+  redistribute(device_data data)
       : d(data)
-      , t_1((*d).density * (*d).accel / 9.)
-      , t_2((*d).density * (*d).accel / 36.)
+      , t_1(d.density * d.accel / 9.)
+      , t_2(d.density * d.accel / 36.)
   {}
 
   __device__
-  void operator()(const Idx c) const {
-    const Idx xi = (*d).x(c);
+  void operator()(const Idx c) {
+    const Idx xi = d.x(c);
     if (xi != 0) { return; }
-    const Idx yi = (*d).y(c);
-    if (!(*d).obst(0,yi)  // accelerate flow only on non-occupied nodes
+    const Idx yi = d.y(c);
+    if (!d.obst(0,yi)  // accelerate flow only on non-occupied nodes
         // check to avoid negative densities:
-        && (*d).nodes(3, 0, yi) - t_1 > 0.
-        && (*d).nodes(6, 0, yi) - t_2 > 0.
-        && (*d).nodes(7, 0, yi) - t_2 > 0.
+        && d.nodes(3, 0, yi) - t_1 > 0.
+        && d.nodes(6, 0, yi) - t_2 > 0.
+        && d.nodes(7, 0, yi) - t_2 > 0.
         ) {
-      (*d).nodes(1, 0, yi) += t_1;  // increase east
-      (*d).nodes(5, 0, yi) += t_2;  // increase north-east
-      (*d).nodes(8, 0, yi) += t_2;  // increase south-east
+      d.nodes(1, 0, yi) += t_1;  // increase east
+      d.nodes(5, 0, yi) += t_2;  // increase north-east
+      d.nodes(8, 0, yi) += t_2;  // increase south-east
 
-      (*d).nodes(3, 0, yi) -= t_1;  // decrease west
-      (*d).nodes(6, 0, yi) -= t_2;  // decrease north-west
-      (*d).nodes(7, 0, yi) -= t_2;  // decrease south-west
+      d.nodes(3, 0, yi) -= t_1;  // decrease west
+      d.nodes(6, 0, yi) -= t_2;  // decrease north-west
+      d.nodes(7, 0, yi) -= t_2;  // decrease south-west
     }
   }
 };
 
 struct propagate {
-  raw_data_ptr d;
+  device_data d;
+
+  __host__ __device__
+  propagate(device_data data) : d(data) {}
 
   __device__
-  propagate(raw_data_ptr data) : d(data) {}
-
-  __device__
-  void operator()(const Idx c) const {
-    BOOST_FOREACH(Idx n, (*d).node_ids())
+  void operator()(const Idx c) {
+    for (thrust::counting_iterator<Idx> bIt = d.node_ids().begin(),
+                                        eIt = d.node_ids().end();
+         bIt != eIt; ++bIt)
     {
-      (*d).nodes_hlp((*d).neighbor(c, n), n) = (*d).nodes(c, n);
+      const Idx n = *bIt;
+      d.nodes_hlp(d.neighbor(c, n), n) = d.nodes(c, n);
     }
   }
 };
 
 struct bounceback {
-  raw_data_ptr d;
+  device_data d;
+
+  __host__ __device__
+  bounceback(device_data data) : d(data) {}
 
   __device__
-  bounceback(raw_data_ptr data) : d(data) {}
-
-  __device__
-  void operator()(const Idx c) const {
-    if ((*d).obst(c)) {
-      BOOST_FOREACH(Idx n, (*d).node_ids())
+  void operator()(const Idx c) {
+    if (d.obst(c)) {
+      for (thrust::counting_iterator<Idx> bIt = d.node_ids().begin(),
+                                          eIt = d.node_ids().end();
+           bIt != eIt; ++bIt)
       {
-        (*d).nodes(c, n) = (*d).nodes_hlp(c, (*d).opposite_node(n));
+        const Idx n = *bIt;
+        d.nodes(c, n) = d.nodes_hlp(c, d.opposite_node(n));
       }
     }
   }
 };
 
 struct relaxation {
-  raw_data_ptr d;
+  device_data d;
   const Num c_squ;
   const Num omega;
   const Num t_0;
   const Num t_1;
   const Num t_2;
 
-  __device__
-  relaxation(raw_data_ptr data)
+  __host__ __device__
+  relaxation(device_data data)
         : d(data)
-        , c_squ((*d).c_squ)
-        , omega((*d).omega)
+        , c_squ(d.c_squ)
+        , omega(d.omega)
         , t_0(4. / 9.)
         , t_1(1. /  9.)
         , t_2(1. / 36.)
   {}
 
   __device__
-  void operator()(const Idx c) const {
-    if ((*d).obst(c)) { return; }
+  void operator()(const Idx c) {
+    if (d.obst(c)) { return; }
 
     // integral local density:
     const Num dloc = density<hlp_vars>(d)(c);
@@ -413,16 +399,19 @@ struct relaxation {
     const Num sx[9] = { 0., 1., 0., -1., 0., 1., -1., -1., 1.};
     const Num sy[9] = { 0., 0., 1., 0., -1., 1., 1., -1., -1.};
     Num u_n[9];
-    BOOST_FOREACH(Idx i, (*d).node_ids())
+    for (thrust::counting_iterator<Idx> bIt = d.node_ids().begin(),
+                                        eIt = d.node_ids().end();
+         bIt != eIt; ++bIt)
     {
+      const Idx i = *bIt;
       u_n[i] = sx[i] * u_x + sy[i] * u_y;
     }
 
     // equilibrium densities:
     // (this can be rewritten to improve computational performance
     // considerabely !)
-    static const Num f0 = 2. * c_squ * c_squ;
-    static const Num f1 = (2. * c_squ);
+    const Num f0 = 2. * c_squ * c_squ;
+    const Num f1 = (2. * c_squ);
     const Num u_squ = std::pow(u_x, 2.) + std::pow(u_y, 2.); // square velocity
     const Num f2 = u_squ / f1;
     const Num f3 = t_1 * dloc;
@@ -432,99 +421,92 @@ struct relaxation {
     n_equ[0] = t_0 * dloc * (1. - f2);  // zero velocity density
 
     // axis speeds (factor: t_1)
-    BOOST_FOREACH(Idx i, (*d).direct_node_ids())
+    for (thrust::counting_iterator<Idx> bIt = d.direct_node_ids().begin(),
+                                        eIt = d.direct_node_ids().end();
+         bIt != eIt; ++bIt)
     {
+      const Idx i = *bIt;
+
       n_equ[i] = f3 * (1. + u_n[i] / c_squ + std::pow(u_n[i], 2.) / f0 - f2);
     }
 
     // diagonal speeds (factor: t_2)
-    BOOST_FOREACH(Idx i, (*d).diagonal_node_ids())
+    for (thrust::counting_iterator<Idx> bIt = d.diagonal_node_ids().begin(),
+                                        eIt = d.diagonal_node_ids().end();
+         bIt != eIt; ++bIt)
     {
+      const Idx i = *bIt;
+
       n_equ[i] = f4 * (1. + u_n[i] / c_squ + std::pow(u_n[i], 2.) / f0 - f2);
     }
 
     // relaxation step
-    BOOST_FOREACH(Idx n, (*d).node_ids())
+    for (thrust::counting_iterator<Idx> bIt = d.node_ids().begin(),
+                                        eIt = d.node_ids().end();
+         bIt != eIt; ++bIt)
     {
-      (*d).nodes(c, n) = (*d).nodes_hlp(c, n)
-                       + omega * (n_equ[n] - (*d).nodes_hlp(c, n));
+      const Idx n = *bIt;
+
+      d.nodes(c, n) = d.nodes_hlp(c, n)
+                       + omega * (n_equ[n] - d.nodes_hlp(c, n));
     }
   }
 };
 
 }  // namespace kernel
 
-namespace launch {
-
-// Initialize density distribution function n with equilibrium
-// for zero velocity
-__device__ void init_variables(data_ptr data) {
-  thrust::for_each(data.get()->cell_ids(), kernel::init_variables(data.get()));
-}
-
-// density redistribution in first lattice column
-// inlet boundary condition?
-__device__ void redistribute(data_ptr data) {
-  // compute weighting factors (depending on lattice geometry) for
-  // increasing/decreasing inlet densities
-  thrust::for_each(data.get()->cell_ids(), kernel::redistribute(data.get()));
-}
-
-// Propagate fluid densities to their next neighbour nodes
-// streaming operator?
-__device__ void propagate(data_ptr data) {
-  thrust::for_each(data.get()->cell_ids(), kernel::propagate(data.get()));
-}
-
-// Fluid densities are rotated by the next propagation step, this results in a
-// bounce back from cells.obstacle nodes.
-// solid-wall condition?
-__device__ void bounceback(data_ptr data) {
-  thrust::for_each(data.get()->cell_ids(), kernel::bounceback(data.get()));
-}
-
-// One-step density relaxation process
-__device__ void relaxation(data_ptr data) {
-  thrust::for_each(data.get()->cell_ids(), kernel::relaxation(data.get()));
-}
-
-// Compute integral density (should remain constant)
-__device__ Num check_density(data_ptr data) {
-  Num n_sum = thrust::transform_reduce
-              (data.get()->cell_ids(), kernel::density<node_vars>(data.get()),
-               Num(0), thrust::plus<Num>());
-  return n_sum;
-}
-
-}  // namespace launch
-
-
 
 struct data_structure {
-  data_ptr data_;
+  thrust::device_vector<Num> nodes;
+  thrust::device_vector<Num> nodes_hlp;
+  device_data data_;
 
   __host__
   data_structure(const Idx lx, const Idx ly)
-      : data_(thrust::device_new<device_data>
-        (thrust::device_ptr<void>((void*)thrust::device_new<device_data>().get()),
-         device_data(lx, ly), 1))
-  {
-    data_.get()->initialize();
-    launch::init_variables(data_);
-  }
+      : nodes(lx * ly * 9)
+      , nodes_hlp(lx * ly * 9)
+      , data_(lx, ly, nodes, nodes_hlp)
+  { init_variables(); }
 
-  __host__
-  ~data_structure() {
-    // thrust::device_delete<device_data>(data_, 1); doesn't work?!
+  // Initialize density distribution function n with equilibrium
+  // for zero velocity
+  __host__ void init_variables()
+  { thrust::for_each(data_.cell_ids(), kernel::init_variables(data_)); }
+
+  // density redistribution in first lattice column
+  // inlet boundary condition?
+  __host__ void redistribute()
+  { thrust::for_each(data_.cell_ids(), kernel::redistribute(data_)); }
+
+  // Propagate fluid densities to their next neighbour nodes
+  // streaming operator?
+  __host__ void propagate()
+  { thrust::for_each(data_.cell_ids(), kernel::propagate(data_)); }
+
+  // Fluid densities are rotated by the next propagation step, this results in a
+  // bounce back from cells.obstacle nodes.
+  // solid-wall condition?
+  __host__ void bounceback()
+  { thrust::for_each(data_.cell_ids(), kernel::bounceback(data_)); }
+
+  // One-step density relaxation process
+  __host__ void relaxation()
+  { thrust::for_each(data_.cell_ids(), kernel::relaxation(data_)); }
+
+  // Compute integral density (should remain constant)
+  __host__ Num check_density() {
+    Num n_sum = thrust::transform_reduce
+                (data_.cell_ids(), kernel::density<node_vars>(data_));
+    return n_sum;
   }
 
   __host__ Num advance(Idx no_iters) {
     for(;;) {
-      launch::redistribute(data_);
-      launch::propagate(data_);
-      launch::bounceback(data_);
-      launch::relaxation(data_);
-      const Num d = launch::check_density(data_);
+      redistribute();
+      propagate();
+      bounceback();
+      relaxation();
+      const Num d = check_density();
       --no_iters;
       if (no_iters == 0) {
         return d;
@@ -536,28 +518,22 @@ struct data_structure {
   template<class T>
   __host__
   thrust::host_vector<Num> ps(T) const {
-    thrust::device_vector<Num> ps_(data_.get()->no_cells());
-    thrust::transform(data_.get()->cell_ids(), ps_.begin(),
-                      kernel::pressure<T>(data_.get()));
-    return ps_;
+    thrust::device_vector<Num> ps_(data_.no_cells());
+    return thrust::transform(data_.cell_ids(), ps_, kernel::pressure<T>(data_));
   }
 
   template<class T>
   __host__
   thrust::host_vector<Num> us(T) const {
-    thrust::device_vector<Num> ps_(data_.get()->no_cells());
-    thrust::transform(data_.get()->cell_ids(), ps_.begin(),
-                      kernel::u<T>(data_.get()));
-    return ps_;
+    thrust::device_vector<Num> ps_(data_.no_cells());
+    return thrust::transform(data_.cell_ids(), ps_, kernel::u<T>(data_));
   }
 
   template<class T>
   __host__
   thrust::host_vector<Num> vs(T) const {
-    thrust::device_vector<Num> ps_(data_.get()->no_cells());
-    thrust::transform(data_.get()->cell_ids(), ps_.begin(),
-                      kernel::v<T>(data_.get()));
-    return ps_;
+    thrust::device_vector<Num> ps_(data_.no_cells());
+    return thrust::transform(data_.cell_ids(), ps_, kernel::v<T>(data_));
   }
 };
 
@@ -565,7 +541,7 @@ __host__
 void write_vtk(const data_structure& cs, int step) {
   char fname[100];
   sprintf(fname, "output_%d.vtk", step);
-  const Idx noCells = cs.data_.get()->no_cells();
+  const Idx noCells = cs.data_.no_cells();
 
   FILE *f = fopen(fname, "w");
   fprintf(f, "# vtk DataFile Version 2.0\n");
@@ -577,10 +553,12 @@ void write_vtk(const data_structure& cs, int step) {
   Num y_stencil[4] = { -1, -1, 1, 1};
   Num length = 1;
   fprintf(f, "POINTS %ld FLOAT\n", noCells * 4);
-  BOOST_FOREACH(Idx i, cs.data_.get()->cell_ids())
-  {
-    Num x = static_cast<Num>(cs.data_.get()->x(i));
-    Num y = static_cast<Num>(cs.data_.get()->y(i));
+  for(thrust::counting_iterator<Idx> it = cs.data_.cell_ids().begin(),
+        it_e = cs.data_.cell_ids().end();
+      it != it_e; ++it) {
+    const Idx i = *it;
+    Num x = static_cast<Num>(cs.data_.x(i));
+    Num y = static_cast<Num>(cs.data_.y(i));
     for (int j = 0; j < 4; ++j) {
       Num xp = x + x_stencil[j] * length / 2;
       Num yp = y + y_stencil[j] * length / 2;
@@ -589,16 +567,18 @@ void write_vtk(const data_structure& cs, int step) {
   }
 
   fprintf(f, "CELLS %ld %ld\n", noCells, noCells*5);
-  BOOST_FOREACH(Idx i, cs.data_.get()->cell_ids())
-  {
+  for(thrust::counting_iterator<Idx> it = cs.data_.cell_ids().begin(),
+        it_e = cs.data_.cell_ids().end();
+      it != it_e; ++it) {
+    const Idx i = *it;
     fprintf(f, "4 %ld %ld %ld %ld\n", 4*i, 4*i+1, 4*i+2, 4*i+3);
   }
 
   fprintf(f, "CELL_TYPES %ld\n", noCells);
   {
     typedef thrust::counting_iterator<Idx> It;
-    for (It i = cs.data_.get()->cell_ids().begin(),
-            e = cs.data_.get()->cell_ids().end(); i != e; ++i) {
+    for (It i = cs.data_.cell_ids().begin(),
+            e = cs.data_.cell_ids().end(); i != e; ++i) {
       {
         fprintf(f, "8\n");
       }
@@ -611,8 +591,10 @@ void write_vtk(const data_structure& cs, int step) {
   fprintf(f, "LOOKUP_TABLE default\n");
   {
     thrust::host_vector<Num> ps = cs.ps(node_vars());
-    BOOST_FOREACH(Idx i, cs.data_.get()->cell_ids())
-    {
+    for(thrust::counting_iterator<Idx> it = cs.data_.cell_ids().begin(),
+          it_e = cs.data_.cell_ids().end();
+        it != it_e; ++it) {
+      const Idx i = *it;
       fprintf(f, "%f\n", ps[i]);
     }
   }
@@ -621,8 +603,10 @@ void write_vtk(const data_structure& cs, int step) {
   fprintf(f, "LOOKUP_TABLE default\n");
   {
     thrust::host_vector<Num> us = cs.us(node_vars());
-    BOOST_FOREACH(Idx i, cs.data_.get()->cell_ids())
-    {
+    for(thrust::counting_iterator<Idx> it = cs.data_.cell_ids().begin(),
+          it_e = cs.data_.cell_ids().end();
+        it != it_e; ++it) {
+      const Idx i = *it;
       fprintf(f, "%f\n", us[i]);
     }
   }
@@ -631,17 +615,21 @@ void write_vtk(const data_structure& cs, int step) {
   fprintf(f, "LOOKUP_TABLE default\n");
   {
     thrust::host_vector<Num> vs = cs.vs(node_vars());
-    BOOST_FOREACH(Idx i, cs.data_.get()->cell_ids())
-    {
+    for(thrust::counting_iterator<Idx> it = cs.data_.cell_ids().begin(),
+          it_e = cs.data_.cell_ids().end();
+        it != it_e; ++it) {
+      const Idx i = *it;
       fprintf(f, "%f\n", vs[i]);
     }
   }
 
   fprintf(f, "SCALARS active int\n");
   fprintf(f, "LOOKUP_TABLE default\n");
-  BOOST_FOREACH(Idx i, cs.data_.get()->cell_ids())
-  {
-    fprintf(f, "%d\n", !cs.data_.get()->obst(i));
+  for(thrust::counting_iterator<Idx> it = cs.data_.cell_ids().begin(),
+        it_e = cs.data_.cell_ids().end();
+      it != it_e; ++it) {
+    const Idx i = *it;
+    fprintf(f, "%d\n", !cs.data_.obst(i));
   }
 
   fclose(f);
